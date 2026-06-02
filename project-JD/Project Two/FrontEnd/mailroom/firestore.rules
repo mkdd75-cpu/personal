@@ -1,0 +1,59 @@
+// firestore.rules
+// Deploy with: firebase deploy --only firestore:rules
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helpers ──────────────────────────────────────────────
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    function isStaff() {
+      return isSignedIn() && getUserData().role in ['staff', 'admin'];
+    }
+
+    function isAdmin() {
+      return isSignedIn() && getUserData().role == 'admin';
+    }
+
+    // ── Users ─────────────────────────────────────────────────
+    // Residents can read their own doc. Staff can read all. Admin can write.
+    match /users/{cardId} {
+      allow read: if isSignedIn() && (request.auth.uid == cardId || isStaff());
+      allow create, update: if isAdmin();
+      allow delete: if isAdmin();
+    }
+
+    // ── Packages ──────────────────────────────────────────────
+    // Residents can read their own packages. Staff can read/write all.
+    match /packages/{packageId} {
+      allow read: if isSignedIn() && (
+        resource.data.recipientCardId == request.auth.uid || isStaff()
+      );
+      allow create: if isStaff();
+      allow update: if isStaff() || (
+        // Residents can only update status to picked_up on their own packages
+        isSignedIn() &&
+        resource.data.recipientCardId == request.auth.uid &&
+        request.resource.data.status == 'picked_up'
+      );
+      allow delete: if isAdmin();
+    }
+
+    // ── Transactions ──────────────────────────────────────────
+    // Append-only audit log. Staff can read. No one can delete.
+    match /transactions/{txId} {
+      allow read: if isStaff() || (
+        isSignedIn() && resource.data.cardId == request.auth.uid
+      );
+      allow create: if isSignedIn();
+      allow update, delete: if false;
+    }
+  }
+}
