@@ -20,6 +20,7 @@
           :class="{ active: activeTab === tab.id }"
           @click="activeTab = tab.id"
         >
+         <button v-if="isAdmin" class="admin-btn" @click="goToAdmin">🔐 Admin Panel</button>
           <span class="nav-icon">{{ tab.icon }}</span>
           <span class="nav-label">{{ tab.label }}</span>
           <span v-if="tab.id === 'queue' && pendingPackages.length" class="nav-badge">
@@ -157,9 +158,8 @@
                     v-model="recipientSearch"
                     class="form-input"
                     placeholder="Search by name or unit..."
-                    @input="searchResidents"
+                    @input="onRecipientInput"
                   />
-                  <button @click="searchResidents">Search</button>
                   <div v-if="residentResults.length" class="resident-dropdown">
                     <button
                       v-for="r in residentResults"
@@ -306,13 +306,15 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  getAllPendingPackages,
   checkInPackage,
   checkOutPackage,
-  getAllUsers,
+  subscribeToAllPendingPackages,
+  subscribeToAllUsers,
+  subscribeToRecentPackages,
+  searchResidentsByField,
 } from '@/services/firestoreService'
 import { CARRIERS } from '@/models'
 
@@ -332,11 +334,42 @@ const pendingPackages = ref([])
 const historyPackages = ref([])
 const allUsers = ref([])
 const loadingQueue = ref(true)
-const loadingHistory = ref(false)
+const loadingHistory = ref(true)
 const checkingOut = ref(null)
 const recentlyLogged = ref([])
 const submitting = ref(false)
 const successMsg = ref('')
+
+// ── Listeners ──────────────────────────────────────────────────────────────
+let unsubQueue = null
+let unsubHistory = null
+let unsubUsers = null
+
+onMounted(() => {
+  // Live queue — updates instantly when staff logs a package or resident picks up
+  unsubQueue = subscribeToAllPendingPackages(
+    (pkgs) => { pendingPackages.value = pkgs; loadingQueue.value = false },
+    (err) => { console.error('[StaffDashboard] queue error:', err); loadingQueue.value = false }
+  )
+
+  // Live user list — used for recipient search in Log Package tab
+  unsubUsers = subscribeToAllUsers(
+    (users) => { allUsers.value = users },
+    (err) => console.error('[StaffDashboard] users error:', err)
+  )
+
+  // Live history — starts listening immediately so it's ready when tab opens
+  unsubHistory = subscribeToRecentPackages(50,
+    (pkgs) => { historyPackages.value = pkgs; loadingHistory.value = false },
+    (err) => { console.error('[StaffDashboard] history error:', err); loadingHistory.value = false }
+  )
+})
+
+onUnmounted(() => {
+  unsubQueue?.()
+  unsubHistory?.()
+  unsubUsers?.()
+})
 
 // ── Queue filters ──────────────────────────────────────────────────────────
 const searchQuery = ref('')
@@ -378,31 +411,27 @@ const carriers = CARRIERS
 const form = ref({ recipient: null, carrier: null, trackingNumber: '', notes: '' })
 const recipientSearch = ref('')
 const residentResults = ref([])
+const searching = ref(false)
 
 const canSubmit = computed(() => form.value.recipient && form.value.carrier)
 
-// function searchResidents() {
-//   const q = recipientSearch.value.toLowerCase()
-//   if (!q) { residentResults.value = []; return }
-//   residentResults.value = allUsers.value
-//     .filter(u => u.role === 'resident' &&
-//       (u.name?.toLowerCase().includes(q) || u.unit?.toLowerCase().includes(q))
-//     )
-//     .slice(0, 6)
-// }
-
-function searchResidents() {
-  const q = recipientSearch.value.toLowerCase()
+// Debounced Firestore search — queries live on every keystroke (debounced 300ms)
+let searchTimeout = null
+async function onRecipientInput() {
+  clearTimeout(searchTimeout)
+  const q = recipientSearch.value.trim()
   if (!q) { residentResults.value = []; return }
-  residentResults.value = allUsers.value
-    .filter(u => u.role === 'resident' &&
-      (
-        u.name?.toLowerCase().includes(q) ||
-        u.email?.toLowerCase().includes(q) ||
-        u.unit?.toLowerCase().includes(q)
-      )
-    )
-    .slice(0, 6)
+  searchTimeout = setTimeout(async () => {
+    searching.value = true
+    try {
+      residentResults.value = await searchResidentsByField(q)
+    } catch (err) {
+      console.error('[StaffDashboard] search error:', err)
+      residentResults.value = []
+    } finally {
+      searching.value = false
+    }
+  }, 300)
 }
 
 function selectRecipient(resident) {
@@ -414,7 +443,6 @@ function selectRecipient(resident) {
 async function submitPackage() {
   if (!canSubmit.value || submitting.value) return
   submitting.value = true
-
   try {
     const pkg = await checkInPackage({
       recipientCardId: form.value.recipient.id,
@@ -423,15 +451,11 @@ async function submitPackage() {
       carrier: form.value.carrier,
       trackingNumber: form.value.trackingNumber,
       notes: form.value.notes,
-    }, 'staff') // TODO: replace 'staff' with actual staff cardId from auth store
+    }, 'staff')
 
     recentlyLogged.value.unshift(pkg)
-    pendingPackages.value.unshift(pkg)
-
     successMsg.value = `✓ Package logged for ${form.value.recipient.name}`
     setTimeout(() => { successMsg.value = '' }, 3000)
-
-    // Reset form
     form.value = { recipient: null, carrier: null, trackingNumber: '', notes: '' }
   } catch (err) {
     console.error('[StaffDashboard] log error:', err)
@@ -441,11 +465,11 @@ async function submitPackage() {
 }
 
 // ── Queue checkout ─────────────────────────────────────────────────────────
+// No need to manually remove from list — the onSnapshot listener does it automatically
 async function staffCheckout(pkg) {
   checkingOut.value = pkg.id
   try {
     await checkOutPackage(pkg.id, pkg.recipientCardId, 'staff')
-    pendingPackages.value = pendingPackages.value.filter(p => p.id !== pkg.id)
   } catch (err) {
     console.error('[StaffDashboard] checkout error:', err)
   } finally {
@@ -453,37 +477,12 @@ async function staffCheckout(pkg) {
   }
 }
 
-// ── History tab ────────────────────────────────────────────────────────────
-watch(activeTab, async (tab) => {
-  if (tab === 'history' && historyPackages.value.length === 0) {
-    loadingHistory.value = true
-    try {
-      const { getDocs, collection, orderBy, query, limit } = await import('firebase/firestore')
-      const { db } = await import('@/firebase/config')
-      const q = query(collection(db, 'packages'), orderBy('checkedInAt', 'desc'), limit(50))
-      const snap = await getDocs(q)
-      historyPackages.value = snap.docs.map(d => ({ id: d.id, ...d.data() }))
-    } catch (err) {
-      console.error(err)
-    } finally {
-      loadingHistory.value = false
-    }
-  }
-})
+const isAdmin = history.state?.userRole === 'admin' || false
 
-// ── Load ───────────────────────────────────────────────────────────────────
-onMounted(async () => {
-  const [pkgs, users] = await Promise.all([
-    getAllPendingPackages(),
-    getAllUsers(),
-  ])
-  pendingPackages.value = pkgs
-  allUsers.value = users.filter(u => u.role === 'resident')
-  loadingQueue.value = false
-})
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 function goToScan() { router.push({ name: 'scan' }) }
+function goToAdmin() { router.push({ name: 'admin' }) }
 
 function formatTime(ts) {
   if (!ts) return '—'
