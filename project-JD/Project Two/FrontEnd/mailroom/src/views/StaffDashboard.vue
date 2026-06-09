@@ -1,6 +1,216 @@
 <!-- src/views/StaffDashboard.vue -->
-<!-- Staff-only view. Reached by swiping a staff/admin card.               -->
-<!-- Tabs: Queue (all pending), Log Package (check in new), History         -->
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  checkInPackage,
+  checkOutPackage,
+  subscribeToAllPendingPackages,
+  subscribeToAllUsers,
+  subscribeToRecentPackages,
+} from '@/services/firestoreService'
+import { useAuthStore } from '@/stores/auth'
+import { CARRIERS } from '@/models'
+
+const router = useRouter()
+const auth = useAuthStore()
+
+// ── Redirect unauthenticated users back to scanner ─────────────────────────
+if (!auth.isLoggedIn) {
+  router.replace({ name: 'scan' })
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+const tabs = [
+  { id: 'queue',   label: 'Package Queue',  icon: '⬛' },
+  { id: 'log',     label: 'Log Package',    icon: '＋' },
+  { id: 'history', label: 'History',        icon: '◷'  },
+]
+const activeTab = ref('queue')
+const currentTab = computed(() => tabs.find(t => t.id === activeTab.value))
+
+// ── Data ───────────────────────────────────────────────────────────────────
+const pendingPackages = ref([])
+const historyPackages = ref([])
+const allUsers = ref([])
+const loadingQueue = ref(true)
+const loadingHistory = ref(true)
+const checkingOut = ref(null)
+const recentlyLogged = ref([])
+const submitting = ref(false)
+const successMsg = ref('')
+
+// ── Listeners ──────────────────────────────────────────────────────────────
+let unsubQueue = null
+let unsubHistory = null
+let unsubUsers = null
+
+onMounted(() => {
+  // Live queue — updates instantly when staff logs a package or resident picks up
+  unsubQueue = subscribeToAllPendingPackages(
+    (pkgs) => { pendingPackages.value = pkgs; loadingQueue.value = false },
+    (err) => { console.error('[StaffDashboard] queue error:', err); loadingQueue.value = false }
+  )
+
+  // Live user list — used for recipient search in Log Package tab
+  unsubUsers = subscribeToAllUsers(
+    (users) => { allUsers.value = users },
+    (err) => console.error('[StaffDashboard] users error:', err)
+  )
+
+  // Live history — starts listening immediately so it's ready when tab opens
+  unsubHistory = subscribeToRecentPackages(50,
+    (pkgs) => { historyPackages.value = pkgs; loadingHistory.value = false },
+    (err) => { console.error('[StaffDashboard] history error:', err); loadingHistory.value = false }
+  )
+})
+
+onUnmounted(() => {
+  unsubQueue?.()
+  unsubHistory?.()
+  unsubUsers?.()
+})
+
+// ── Queue filters ──────────────────────────────────────────────────────────
+const searchQuery = ref('')
+const activeCarrier = ref(null)
+const carrierFilters = ['UPS', 'FedEx', 'USPS', 'Amazon', 'DHL']
+
+const filteredPackages = computed(() => {
+  let list = pendingPackages.value
+
+  // Carrier pill filter
+  if (activeCarrier.value) list = list.filter(p => p.carrier === activeCarrier.value)
+
+  // Text search — matches any part of name, unit, email, carrier, or tracking
+  if (searchQuery.value) {
+    const q = searchQuery.value.toLowerCase()
+    list = list.filter(p => {
+      // Look up the recipient's email from allUsers by cardId
+      const recipientUser = allUsers.value.find(u => u.id === p.recipientCardId)
+      return (
+        p.recipientName?.toLowerCase().includes(q) ||
+        p.recipientUnit?.toLowerCase().includes(q) ||
+        p.carrier?.toLowerCase().includes(q) ||
+        p.trackingNumber?.toLowerCase().includes(q) ||
+        recipientUser?.email?.toLowerCase().includes(q)
+      )
+    })
+  }
+  return list
+})
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+const currentDate = computed(() =>
+  new Date().toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })
+)
+
+const todayCount = computed(() => {
+  const today = new Date()
+  today.setHours(0, 0, 0, 0)
+  return pendingPackages.value.filter(p => {
+    if (!p.checkedInAt) return false
+    const d = p.checkedInAt.toDate ? p.checkedInAt.toDate() : new Date(p.checkedInAt)
+    return d >= today
+  }).length
+})
+
+// ── Log package form ───────────────────────────────────────────────────────
+const carriers = CARRIERS
+const form = ref({ recipient: null, carrier: null, trackingNumber: '', notes: '' })
+const recipientSearch = ref('')
+const residentResults = ref([])
+
+const canSubmit = computed(() => form.value.recipient && form.value.carrier)
+
+// In-memory search — same approach as AdminPanel, filters the live allUsers array
+// Matches any part of name, unit, or email using .includes()
+function onRecipientInput() {
+  const q = recipientSearch.value.toLowerCase().trim()
+  if (!q) { residentResults.value = []; return }
+  residentResults.value = allUsers.value
+    .filter(u => u.role === 'resident' && (
+      u.name?.toLowerCase().includes(q) ||
+      u.unit?.toLowerCase().includes(q) ||
+      u.email?.toLowerCase().includes(q)
+    ))
+    .slice(0, 8)
+}
+
+function selectRecipient(resident) {
+  form.value.recipient = resident
+  recipientSearch.value = ''
+  residentResults.value = []
+}
+
+async function submitPackage() {
+  if (!canSubmit.value || submitting.value) return
+  submitting.value = true
+  try {
+    const pkg = await checkInPackage({
+      recipientCardId: form.value.recipient.id,
+      recipientName: form.value.recipient.name,
+      recipientUnit: form.value.recipient.unit,
+      carrier: form.value.carrier,
+      trackingNumber: form.value.trackingNumber,
+      notes: form.value.notes,
+    }, 'staff')
+
+    recentlyLogged.value.unshift(pkg)
+    successMsg.value = `✓ Package logged for ${form.value.recipient.name}`
+    setTimeout(() => { successMsg.value = '' }, 3000)
+    form.value = { recipient: null, carrier: null, trackingNumber: '', notes: '' }
+  } catch (err) {
+    console.error('[StaffDashboard] log error:', err)
+  } finally {
+    submitting.value = false
+  }
+}
+
+// ── Queue checkout ─────────────────────────────────────────────────────────
+// No need to manually remove from list — the onSnapshot listener does it automatically
+async function staffCheckout(pkg) {
+  checkingOut.value = pkg.id
+  try {
+    await checkOutPackage(pkg.id, pkg.recipientCardId, 'staff')
+  } catch (err) {
+    console.error('[StaffDashboard] checkout error:', err)
+  } finally {
+    checkingOut.value = null
+  }
+}
+
+// ── User menu ──────────────────────────────────────────────────────────────
+const showUserMenu = ref(false)
+
+const userInitials = computed(() =>
+  auth.displayName?.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() ?? '?'
+)
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function goToScan() { router.push({ name: 'scan' }) }
+function goToAdmin() { showUserMenu.value = false; router.push({ name: 'admin' }) }
+function signOut() { auth.logout(); router.push({ name: 'scan' }) }
+
+function formatTime(ts) {
+  if (!ts) return '—'
+  const d = ts.toDate ? ts.toDate() : new Date(ts)
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
+    ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+}
+
+function packageAge(pkg) {
+  if (!pkg.checkedInAt) return 0
+  const d = pkg.checkedInAt.toDate ? pkg.checkedInAt.toDate() : new Date(pkg.checkedInAt)
+  return Math.floor((Date.now() - d) / 86400000)
+}
+
+function initials(name) {
+  return name?.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() ?? '?'
+}
+</script>
+
 
 <template>
   <div class="dashboard">
@@ -20,7 +230,6 @@
           :class="{ active: activeTab === tab.id }"
           @click="activeTab = tab.id"
         >
-         <button v-if="isAdmin" class="admin-btn" @click="goToAdmin">🔐 Admin Panel</button>
           <span class="nav-icon">{{ tab.icon }}</span>
           <span class="nav-label">{{ tab.label }}</span>
           <span v-if="tab.id === 'queue' && pendingPackages.length" class="nav-badge">
@@ -29,9 +238,31 @@
         </button>
       </nav>
 
-      <div class="sidebar-footer">
-        <button class="scan-btn" @click="goToScan">← Back to Scanner</button>
+      <!-- User profile section -->
+      <div class="sidebar-user" @click="showUserMenu = !showUserMenu">
+        <div class="user-avatar">{{ userInitials }}</div>
+        <div class="user-info">
+          <div class="user-name">{{ auth.displayName || 'Staff' }}</div>
+          <div class="user-role" :class="auth.role">{{ auth.role }}</div>
+        </div>
+        <span class="user-chevron" :class="{ open: showUserMenu }">›</span>
       </div>
+
+      <!-- User dropdown menu -->
+      <transition name="menu-slide">
+        <div v-if="showUserMenu" class="user-menu">
+          <button v-if="auth.isAdmin" class="user-menu-item admin" @click="goToAdmin">
+            🔐 Admin Panel
+          </button>
+          <button class="user-menu-item" @click="goToScan">
+            ← Back to Scanner
+          </button>
+          <div class="user-menu-divider" />
+          <button class="user-menu-item signout" @click="signOut">
+            Sign Out
+          </button>
+        </div>
+      </transition>
     </aside>
 
     <!-- Main content -->
@@ -305,202 +536,6 @@
   </div>
 </template>
 
-<script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import {
-  checkInPackage,
-  checkOutPackage,
-  subscribeToAllPendingPackages,
-  subscribeToAllUsers,
-  subscribeToRecentPackages,
-  searchResidentsByField,
-} from '@/services/firestoreService'
-import { CARRIERS } from '@/models'
-
-const router = useRouter()
-
-// ── Tabs ───────────────────────────────────────────────────────────────────
-const tabs = [
-  { id: 'queue',   label: 'Package Queue',  icon: '⬛' },
-  { id: 'log',     label: 'Log Package',    icon: '＋' },
-  { id: 'history', label: 'History',        icon: '◷'  },
-]
-const activeTab = ref('queue')
-const currentTab = computed(() => tabs.find(t => t.id === activeTab.value))
-
-// ── Data ───────────────────────────────────────────────────────────────────
-const pendingPackages = ref([])
-const historyPackages = ref([])
-const allUsers = ref([])
-const loadingQueue = ref(true)
-const loadingHistory = ref(true)
-const checkingOut = ref(null)
-const recentlyLogged = ref([])
-const submitting = ref(false)
-const successMsg = ref('')
-
-// ── Listeners ──────────────────────────────────────────────────────────────
-let unsubQueue = null
-let unsubHistory = null
-let unsubUsers = null
-
-onMounted(() => {
-  // Live queue — updates instantly when staff logs a package or resident picks up
-  unsubQueue = subscribeToAllPendingPackages(
-    (pkgs) => { pendingPackages.value = pkgs; loadingQueue.value = false },
-    (err) => { console.error('[StaffDashboard] queue error:', err); loadingQueue.value = false }
-  )
-
-  // Live user list — used for recipient search in Log Package tab
-  unsubUsers = subscribeToAllUsers(
-    (users) => { allUsers.value = users },
-    (err) => console.error('[StaffDashboard] users error:', err)
-  )
-
-  // Live history — starts listening immediately so it's ready when tab opens
-  unsubHistory = subscribeToRecentPackages(50,
-    (pkgs) => { historyPackages.value = pkgs; loadingHistory.value = false },
-    (err) => { console.error('[StaffDashboard] history error:', err); loadingHistory.value = false }
-  )
-})
-
-onUnmounted(() => {
-  unsubQueue?.()
-  unsubHistory?.()
-  unsubUsers?.()
-})
-
-// ── Queue filters ──────────────────────────────────────────────────────────
-const searchQuery = ref('')
-const activeCarrier = ref(null)
-const carrierFilters = ['UPS', 'FedEx', 'USPS', 'Amazon', 'DHL']
-
-const filteredPackages = computed(() => {
-  let list = pendingPackages.value
-  if (activeCarrier.value) list = list.filter(p => p.carrier === activeCarrier.value)
-  if (searchQuery.value) {
-    const q = searchQuery.value.toLowerCase()
-    list = list.filter(p =>
-      p.recipientName?.toLowerCase().includes(q) ||
-      p.recipientUnit?.toLowerCase().includes(q) ||
-      p.carrier?.toLowerCase().includes(q) ||
-      p.trackingNumber?.toLowerCase().includes(q)
-    )
-  }
-  return list
-})
-
-// ── Stats ──────────────────────────────────────────────────────────────────
-const currentDate = computed(() =>
-  new Date().toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })
-)
-
-const todayCount = computed(() => {
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  return pendingPackages.value.filter(p => {
-    if (!p.checkedInAt) return false
-    const d = p.checkedInAt.toDate ? p.checkedInAt.toDate() : new Date(p.checkedInAt)
-    return d >= today
-  }).length
-})
-
-// ── Log package form ───────────────────────────────────────────────────────
-const carriers = CARRIERS
-const form = ref({ recipient: null, carrier: null, trackingNumber: '', notes: '' })
-const recipientSearch = ref('')
-const residentResults = ref([])
-const searching = ref(false)
-
-const canSubmit = computed(() => form.value.recipient && form.value.carrier)
-
-// Debounced Firestore search — queries live on every keystroke (debounced 300ms)
-let searchTimeout = null
-async function onRecipientInput() {
-  clearTimeout(searchTimeout)
-  const q = recipientSearch.value.trim()
-  if (!q) { residentResults.value = []; return }
-  searchTimeout = setTimeout(async () => {
-    searching.value = true
-    try {
-      residentResults.value = await searchResidentsByField(q)
-    } catch (err) {
-      console.error('[StaffDashboard] search error:', err)
-      residentResults.value = []
-    } finally {
-      searching.value = false
-    }
-  }, 300)
-}
-
-function selectRecipient(resident) {
-  form.value.recipient = resident
-  recipientSearch.value = ''
-  residentResults.value = []
-}
-
-async function submitPackage() {
-  if (!canSubmit.value || submitting.value) return
-  submitting.value = true
-  try {
-    const pkg = await checkInPackage({
-      recipientCardId: form.value.recipient.id,
-      recipientName: form.value.recipient.name,
-      recipientUnit: form.value.recipient.unit,
-      carrier: form.value.carrier,
-      trackingNumber: form.value.trackingNumber,
-      notes: form.value.notes,
-    }, 'staff')
-
-    recentlyLogged.value.unshift(pkg)
-    successMsg.value = `✓ Package logged for ${form.value.recipient.name}`
-    setTimeout(() => { successMsg.value = '' }, 3000)
-    form.value = { recipient: null, carrier: null, trackingNumber: '', notes: '' }
-  } catch (err) {
-    console.error('[StaffDashboard] log error:', err)
-  } finally {
-    submitting.value = false
-  }
-}
-
-// ── Queue checkout ─────────────────────────────────────────────────────────
-// No need to manually remove from list — the onSnapshot listener does it automatically
-async function staffCheckout(pkg) {
-  checkingOut.value = pkg.id
-  try {
-    await checkOutPackage(pkg.id, pkg.recipientCardId, 'staff')
-  } catch (err) {
-    console.error('[StaffDashboard] checkout error:', err)
-  } finally {
-    checkingOut.value = null
-  }
-}
-
-const isAdmin = history.state?.userRole === 'admin' || false
-
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-function goToScan() { router.push({ name: 'scan' }) }
-function goToAdmin() { router.push({ name: 'admin' }) }
-
-function formatTime(ts) {
-  if (!ts) return '—'
-  const d = ts.toDate ? ts.toDate() : new Date(ts)
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
-    ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-}
-
-function packageAge(pkg) {
-  if (!pkg.checkedInAt) return 0
-  const d = pkg.checkedInAt.toDate ? pkg.checkedInAt.toDate() : new Date(pkg.checkedInAt)
-  return Math.floor((Date.now() - d) / 86400000)
-}
-
-function initials(name) {
-  return name?.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() ?? '?'
-}
-</script>
 
 <style scoped>
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600&family=Outfit:wght@300;400;500;600&display=swap');
@@ -598,6 +633,105 @@ function initials(name) {
   text-align: left;
 }
 .scan-btn:hover { border-color: #58a6ff; color: #58a6ff; }
+
+/* ── User profile ──────────────────────────────────────────────────────── */
+.sidebar-user {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.9rem 1.25rem;
+  border-top: 1px solid #30363d;
+  cursor: pointer;
+  transition: background 0.15s;
+  position: relative;
+}
+.sidebar-user:hover { background: #21262d; }
+
+.user-avatar {
+  width: 34px; height: 34px;
+  border-radius: 8px;
+  background: #1c2d3d;
+  border: 1px solid #30363d;
+  color: #58a6ff;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem; font-weight: 600;
+  flex-shrink: 0;
+}
+
+.user-info { flex: 1; min-width: 0; }
+.user-name {
+  font-size: 0.82rem; font-weight: 500;
+  color: #e6edf3;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.user-role {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.1em;
+  margin-top: 0.1rem;
+}
+.user-role.staff { color: #58a6ff; }
+.user-role.admin { color: #f0b429; }
+
+.user-chevron {
+  font-size: 1.1rem; color: #8b949e;
+  transition: transform 0.2s;
+  line-height: 1;
+}
+.user-chevron.open { transform: rotate(90deg); }
+
+/* ── User dropdown menu ────────────────────────────────────────────────── */
+.user-menu {
+  background: #0d1117;
+  border-top: 1px solid #30363d;
+  padding: 0.4rem 0;
+}
+
+.user-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  width: 100%;
+  padding: 0.6rem 1.25rem;
+  background: none;
+  border: none;
+  color: #8b949e;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.12s;
+  text-align: left;
+}
+.user-menu-item:hover { background: #21262d; color: #c9d1d9; }
+.user-menu-item.admin { color: #f0b429; }
+.user-menu-item.admin:hover { background: rgba(240,180,41,0.08); color: #f0b429; }
+.user-menu-item.signout:hover { background: rgba(248,81,73,0.1); color: #f85149; }
+
+.user-menu-divider {
+  height: 1px;
+  background: #21262d;
+  margin: 0.3rem 0;
+}
+
+.menu-slide-enter-active { transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1); }
+.menu-slide-leave-active { transition: all 0.15s ease; }
+.menu-slide-enter-from, .menu-slide-leave-to { opacity: 0; transform: translateY(-4px); }
+
+.admin-btn {
+  width: 100%;
+  background: rgba(240,180,41,0.08);
+  border: 1px solid rgba(240,180,41,0.25);
+  color: #f0b429;
+  padding: 0.55rem 0.75rem;
+  border-radius: 8px;
+  font-family: 'Outfit', sans-serif;
+  font-size: 0.82rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  text-align: left;
+  margin-bottom: 0.5rem;
+}
+.admin-btn:hover { background: rgba(240,180,41,0.15); border-color: #f0b429; }
 
 /* ── Content ───────────────────────────────────────────────────────────── */
 .content {

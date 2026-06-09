@@ -1,4 +1,202 @@
 <!-- src/views/ScanView.vue -->
+
+
+<script setup>
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { useRouter } from 'vue-router'
+import { useCardReader } from '@/composables/useCardReader'
+import { getUserByCardId, getUserByEmail } from '@/services/firestoreService'
+import { useAuthStore } from '@/stores/auth'
+
+const router = useRouter()
+const auth = useAuthStore()
+
+// ── State ──────────────────────────────────────────────────────────────────
+const state = ref('idle')
+const foundUser = ref(null)
+const errorMessage = ref('')
+const countdownWidth = ref(100)
+
+// ── Manual sign in ─────────────────────────────────────────────────────────
+const showManual = ref(false)
+const manualEmail = ref('')
+const manualLast4 = ref('')
+const manualLoading = ref(false)
+const manualError = ref('')
+const manualInputRef = ref(null)
+const last4Ref = ref(null)
+
+const canSubmitManual = computed(() =>
+  manualEmail.value.trim().length > 3 &&
+  manualLast4.value.trim().length === 4
+)
+
+function openManual() {
+  manualEmail.value = ''
+  manualLast4.value = ''
+  manualError.value = ''
+  showManual.value = true
+  nextTick(() => manualInputRef.value?.focus())
+}
+
+function closeManual() {
+  showManual.value = false
+  manualEmail.value = ''
+  manualLast4.value = ''
+  manualError.value = ''
+}
+
+function focusLast4() {
+  last4Ref.value?.focus()
+}
+
+async function submitManual() {
+  if (!canSubmitManual.value || manualLoading.value) return
+
+  manualLoading.value = true
+  manualError.value = ''
+
+  try {
+    // 1. Look up by email
+    const user = await getUserByEmail(manualEmail.value)
+
+    if (!user) {
+      manualError.value = 'No account found with that email address.'
+      manualLoading.value = false
+      return
+    }
+
+    // 2. Check last 4 digits of their registered card
+    const cardLast4 = user.cardId?.slice(-4)
+    if (cardLast4 !== manualLast4.value.trim()) {
+      manualError.value = 'Card digits do not match. Please try again.'
+      manualLoading.value = false
+      return
+    }
+
+    // 3. Check account is active
+    if (user.active === false) {
+      manualError.value = 'This account has been deactivated. Please see staff.'
+      manualLoading.value = false
+      return
+    }
+
+    // Success
+    showManual.value = false
+    manualLoading.value = false
+    foundUser.value = user
+    state.value = 'found'
+    setTimeout(() => routeUser(user), 1800)
+
+  } catch (err) {
+    console.error('[ScanView] manual login error:', err)
+    manualError.value = 'Connection error. Please try again.'
+    manualLoading.value = false
+  }
+}
+
+// ── Routing ────────────────────────────────────────────────────────────────
+function routeUser(user) {
+  auth.login(user) // ← store the user globally
+  if (user.role === 'resident') {
+    router.push({ name: 'resident', params: { cardId: user.id } })
+  } else if (user.role === 'staff') {
+    router.push({ name: 'staff-dashboard' })
+  } else if (user.role === 'admin') {
+    router.push({ name: 'admin' })
+  }
+}
+
+// ── Clock ──────────────────────────────────────────────────────────────────
+const currentTime = ref('')
+const currentDate = ref('')
+let clockInterval = null
+
+function updateClock() {
+  const now = new Date()
+  currentTime.value = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+  currentDate.value = now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })
+}
+
+onMounted(() => {
+  // Always reset to idle when this view is reached so the reader is ready
+  state.value = 'idle'
+  foundUser.value = null
+  errorMessage.value = ''
+  showManual.value = false
+  updateClock()
+  clockInterval = setInterval(updateClock, 1000)
+})
+onUnmounted(() => { clearInterval(clockInterval); clearTimeout(resetTimer); clearInterval(countdownInterval) })
+
+// ── Computed ───────────────────────────────────────────────────────────────
+const initials = computed(() => {
+  if (!foundUser.value?.name) return '?'
+  return foundUser.value.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase()
+})
+
+const stateClass = computed(() => ({
+  'state-found': state.value === 'found',
+  'state-error': state.value === 'error' || state.value === 'role-mismatch',
+  'state-scanning': state.value === 'scanning',
+}))
+
+// ── Reset ──────────────────────────────────────────────────────────────────
+let resetTimer = null
+let countdownInterval = null
+
+function resetToIdle(delay = 3000) {
+  clearTimeout(resetTimer)
+  clearInterval(countdownInterval)
+  countdownWidth.value = 100
+
+  const steps = delay / 50
+  let step = 0
+  countdownInterval = setInterval(() => {
+    step++
+    countdownWidth.value = 100 - (step / steps) * 100
+    if (step >= steps) clearInterval(countdownInterval)
+  }, 50)
+
+  resetTimer = setTimeout(() => {
+    state.value = 'idle'
+    foundUser.value = null
+    errorMessage.value = ''
+    countdownWidth.value = 100
+  }, delay)
+}
+
+// ── Card swipe handler ─────────────────────────────────────────────────────
+const { isListening } = useCardReader({
+  onSwipe: async ({ cardId }) => {
+    if (state.value === 'scanning' || state.value === 'found') return
+
+    // If manual panel is open, close it and proceed with the swipe normally
+    if (showManual.value) closeManual()
+
+    state.value = 'scanning'
+    foundUser.value = null
+
+    try {
+      const user = await getUserByCardId(cardId)
+      if (!user) { state.value = 'not-found'; resetToIdle(4000); return }
+      foundUser.value = user
+      state.value = 'found'
+      setTimeout(() => routeUser(user), 1800)
+    } catch (err) {
+      errorMessage.value = err.message || 'Could not connect. Please try again.'
+      state.value = 'error'
+      resetToIdle(4000)
+    }
+  },
+  onError: (msg) => {
+    errorMessage.value = msg
+    state.value = 'error'
+    resetToIdle(4000)
+  },
+})
+</script>
+
 <template>
   <div class="scan-view" :class="stateClass">
     <div class="pulse-ring" :class="{ active: state === 'scanning' }" />
@@ -150,194 +348,6 @@
   </div>
 </template>
 
-<script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
-import { useCardReader } from '@/composables/useCardReader'
-import { getUserByCardId, getUserByEmail } from '@/services/firestoreService'
-
-const router = useRouter()
-
-// ── State ──────────────────────────────────────────────────────────────────
-const state = ref('idle')
-const foundUser = ref(null)
-const errorMessage = ref('')
-const countdownWidth = ref(100)
-
-// ── Manual sign in ─────────────────────────────────────────────────────────
-const showManual = ref(false)
-const manualEmail = ref('')
-const manualLast4 = ref('')
-const manualLoading = ref(false)
-const manualError = ref('')
-const manualInputRef = ref(null)
-const last4Ref = ref(null)
-
-const canSubmitManual = computed(() =>
-  manualEmail.value.trim().length > 3 &&
-  manualLast4.value.trim().length === 4
-)
-
-function openManual() {
-  manualEmail.value = ''
-  manualLast4.value = ''
-  manualError.value = ''
-  showManual.value = true
-  nextTick(() => manualInputRef.value?.focus())
-}
-
-function closeManual() {
-  showManual.value = false
-  manualEmail.value = ''
-  manualLast4.value = ''
-  manualError.value = ''
-}
-
-function focusLast4() {
-  last4Ref.value?.focus()
-}
-
-async function submitManual() {
-  if (!canSubmitManual.value || manualLoading.value) return
-
-  manualLoading.value = true
-  manualError.value = ''
-
-  try {
-    // 1. Look up by email
-    const user = await getUserByEmail(manualEmail.value)
-
-    if (!user) {
-      manualError.value = 'No account found with that email address.'
-      manualLoading.value = false
-      return
-    }
-
-    // 2. Check last 4 digits of their registered card
-    const cardLast4 = user.cardId?.slice(-4)
-    if (cardLast4 !== manualLast4.value.trim()) {
-      manualError.value = 'Card digits do not match. Please try again.'
-      manualLoading.value = false
-      return
-    }
-
-    // 3. Check account is active
-    if (user.active === false) {
-      manualError.value = 'This account has been deactivated. Please see staff.'
-      manualLoading.value = false
-      return
-    }
-
-    // Success
-    showManual.value = false
-    manualLoading.value = false
-    foundUser.value = user
-    state.value = 'found'
-    setTimeout(() => routeUser(user), 1800)
-
-  } catch (err) {
-    console.error('[ScanView] manual login error:', err)
-    manualError.value = 'Connection error. Please try again.'
-    manualLoading.value = false
-  }
-}
-
-// ── Routing ────────────────────────────────────────────────────────────────
-function routeUser(user) {
-  if (user.role === 'resident') {
-    router.push({
-      name: 'resident',
-      params: { cardId: user.id },
-      state: { userName: user.name, userUnit: user.unit }
-    })
-  } else if (user.role === 'staff' ) {
-    router.push({ name: 'staff-dashboard' })
-  } else if (user.role === 'admin') {
-    router.push({ name: 'admin' })
-  }
-}
-
-// ── Clock ──────────────────────────────────────────────────────────────────
-const currentTime = ref('')
-const currentDate = ref('')
-let clockInterval = null
-
-function updateClock() {
-  const now = new Date()
-  currentTime.value = now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-  currentDate.value = now.toLocaleDateString([], { weekday: 'long', month: 'long', day: 'numeric' })
-}
-
-onMounted(() => { updateClock(); clockInterval = setInterval(updateClock, 1000) })
-onUnmounted(() => { clearInterval(clockInterval); clearTimeout(resetTimer); clearInterval(countdownInterval) })
-
-// ── Computed ───────────────────────────────────────────────────────────────
-const initials = computed(() => {
-  if (!foundUser.value?.name) return '?'
-  return foundUser.value.name.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase()
-})
-
-const stateClass = computed(() => ({
-  'state-found': state.value === 'found',
-  'state-error': state.value === 'error' || state.value === 'role-mismatch',
-  'state-scanning': state.value === 'scanning',
-}))
-
-// ── Reset ──────────────────────────────────────────────────────────────────
-let resetTimer = null
-let countdownInterval = null
-
-function resetToIdle(delay = 3000) {
-  clearTimeout(resetTimer)
-  clearInterval(countdownInterval)
-  countdownWidth.value = 100
-
-  const steps = delay / 50
-  let step = 0
-  countdownInterval = setInterval(() => {
-    step++
-    countdownWidth.value = 100 - (step / steps) * 100
-    if (step >= steps) clearInterval(countdownInterval)
-  }, 50)
-
-  resetTimer = setTimeout(() => {
-    state.value = 'idle'
-    foundUser.value = null
-    errorMessage.value = ''
-    countdownWidth.value = 100
-  }, delay)
-}
-
-// ── Card swipe handler ─────────────────────────────────────────────────────
-const { isListening } = useCardReader({
-  onSwipe: async ({ cardId }) => {
-    if (state.value === 'scanning' || state.value === 'found') return
-
-    // If manual panel is open, close it and proceed with the swipe normally
-    if (showManual.value) closeManual()
-
-    state.value = 'scanning'
-    foundUser.value = null
-
-    try {
-      const user = await getUserByCardId(cardId)
-      if (!user) { state.value = 'not-found'; resetToIdle(4000); return }
-      foundUser.value = user
-      state.value = 'found'
-      setTimeout(() => routeUser(user), 1800)
-    } catch (err) {
-      errorMessage.value = err.message || 'Could not connect. Please try again.'
-      state.value = 'error'
-      resetToIdle(4000)
-    }
-  },
-  onError: (msg) => {
-    errorMessage.value = msg
-    state.value = 'error'
-    resetToIdle(4000)
-  },
-})
-</script>
 
 <style scoped>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');

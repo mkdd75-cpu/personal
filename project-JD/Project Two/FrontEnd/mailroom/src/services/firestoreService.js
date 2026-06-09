@@ -1,7 +1,3 @@
-// src/services/firestoreService.js
-// All Firestore reads and writes go through here.
-// Listener functions return an unsubscribe function — always call it in onUnmounted.
-
 import {
   doc,
   getDoc,
@@ -26,18 +22,14 @@ import {
   TRANSACTION_TYPES,
 } from '@/models'
 
-// ─────────────────────────────────────────────
-// USERS — one-shot reads (used for auth/login, registration checks)
-// ─────────────────────────────────────────────
+// USERS 
 
-/** Look up a user by card ID. Used by ScanView on swipe/manual login. */
 export async function getUserByCardId(cardId) {
   const ref = doc(db, 'users', cardId)
   const snap = await getDoc(ref)
   return snap.exists() ? { id: snap.id, ...snap.data() } : null
 }
 
-/** Look up a user by email. Used by manual sign-in form. */
 export async function getUserByEmail(email) {
   const q = query(
     collection(db, 'users'),
@@ -49,7 +41,6 @@ export async function getUserByEmail(email) {
   return { id: d.id, ...d.data() }
 }
 
-/** Register a new user. cardId becomes the document ID. */
 export async function registerUser(userData) {
   const ref = doc(db, 'users', userData.cardId)
   const userDoc = createUser({ ...userData, email: userData.email.toLowerCase().trim() })
@@ -57,15 +48,11 @@ export async function registerUser(userData) {
   return { id: userData.cardId, ...userDoc }
 }
 
-/** Update fields on an existing user document. */
 export async function updateUser(cardId, fields) {
   const ref = doc(db, 'users', cardId)
   await updateDoc(ref, fields)
 }
 
-// ─────────────────────────────────────────────
-// USERS — real-time listeners
-// ─────────────────────────────────────────────
 
 /**
  * Subscribe to a single user document by cardId.
@@ -131,6 +118,7 @@ export async function checkOutPackage(packageId, residentCardId, staffCardId = n
 
 /**
  * Subscribe to all PENDING packages for a resident.
+ * Sorts client-side to avoid requiring a composite Firestore index.
  * Returns unsubscribe function.
  */
 export function subscribeToPendingPackagesForResident(cardId, onData, onError) {
@@ -138,27 +126,49 @@ export function subscribeToPendingPackagesForResident(cardId, onData, onError) {
     collection(db, 'packages'),
     where('recipientCardId', '==', cardId),
     where('status', '==', PACKAGE_STATUS.PENDING),
-    orderBy('checkedInAt', 'desc')
   )
   return onSnapshot(q,
-    (snap) => onData(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-    (err) => onError?.(err)
+    (snap) => {
+      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      // Sort newest first client-side
+      docs.sort((a, b) => {
+        const aTime = a.checkedInAt?.toDate?.() ?? new Date(a.checkedInAt ?? 0)
+        const bTime = b.checkedInAt?.toDate?.() ?? new Date(b.checkedInAt ?? 0)
+        return bTime - aTime
+      })
+      onData(docs)
+    },
+    (err) => {
+      console.error('[subscribeToPendingPackagesForResident] Firestore error:', err)
+      onError?.(err)
+    }
   )
 }
 
 /**
  * Subscribe to ALL pending packages (staff dashboard queue).
+ * Sorts client-side to avoid requiring a composite Firestore index.
  * Returns unsubscribe function.
  */
 export function subscribeToAllPendingPackages(onData, onError) {
   const q = query(
     collection(db, 'packages'),
     where('status', '==', PACKAGE_STATUS.PENDING),
-    orderBy('checkedInAt', 'desc')
   )
   return onSnapshot(q,
-    (snap) => onData(snap.docs.map(d => ({ id: d.id, ...d.data() }))),
-    (err) => onError?.(err)
+    (snap) => {
+      const docs = snap.docs.map(d => ({ id: d.id, ...d.data() }))
+      docs.sort((a, b) => {
+        const aTime = a.checkedInAt?.toDate?.() ?? new Date(a.checkedInAt ?? 0)
+        const bTime = b.checkedInAt?.toDate?.() ?? new Date(b.checkedInAt ?? 0)
+        return bTime - aTime
+      })
+      onData(docs)
+    },
+    (err) => {
+      console.error('[subscribeToAllPendingPackages] Firestore error:', err)
+      onError?.(err)
+    }
   )
 }
 

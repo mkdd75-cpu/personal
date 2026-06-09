@@ -1,32 +1,25 @@
 // src/models/index.js
 // Factory functions for all Firestore documents.
-// Use these to create new documents — never write raw objects to Firestore.
 
 import { serverTimestamp } from 'firebase/firestore'
 
-// ─────────────────────────────────────────────
-// ROLES
-// ─────────────────────────────────────────────
 export const ROLES = {
   RESIDENT: 'resident',
   STAFF: 'staff',
   ADMIN: 'admin',
 }
 
-// ─────────────────────────────────────────────
-// PACKAGE STATUS
-// ─────────────────────────────────────────────
 export const PACKAGE_STATUS = {
-  PENDING: 'pending',       // Package received, not yet picked up
-  PICKED_UP: 'picked_up',  // Resident has collected it
+  PENDING: 'pending',       
+  PICKED_UP: 'picked_up',  
 }
 
 // ─────────────────────────────────────────────
 // TRANSACTION TYPES
 // ─────────────────────────────────────────────
 export const TRANSACTION_TYPES = {
-  CHECK_IN: 'checkin',      // Package logged into mailroom
-  CHECK_OUT: 'checkout',    // Package picked up by resident
+  CHECK_IN: 'checkin',      
+  CHECK_OUT: 'checkout',    
 }
 
 // ─────────────────────────────────────────────

@@ -1,123 +1,29 @@
 <!-- src/views/ResidentView.vue -->
-<template>
-  <div class="resident-view">
-    <div class="pulse-bg" />
 
-    <!-- Header -->
-    <header class="header">
-      <button class="back-btn" @click="goBack">← Back</button>
-      <div class="logo">
-        <span class="logo-icon">📬</span>
-        <span class="logo-text">MAILROOM</span>
-      </div>
-      <div class="session-timer" :class="{ urgent: timeLeft <= 15 }">
-        <svg viewBox="0 0 24 24" class="timer-icon"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M12 7v5l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>
-        {{ timeLeft }}s
-      </div>
-    </header>
-
-    <!-- Greeting — shows immediately from router state, no Firestore wait -->
-    <section class="greeting" :class="{ visible: greetingVisible }">
-      <div class="avatar">{{ initials }}</div>
-      <div class="greeting-text">
-        <h1>Hey, {{ fullName }}!</h1>
-        <p class="unit-tag">Unit {{ displayUnit }}</p>
-      </div>
-    </section>
-
-    <!-- Loading -->
-    <div v-if="loading" class="loading-state">
-      <div class="loading-bars"><span /><span /><span /></div>
-      <p>Loading your packages...</p>
-    </div>
-
-    <!-- No packages -->
-    <section v-else-if="packages.length === 0" class="empty-state" :class="{ visible: loaded }">
-      <div class="empty-icon">📭</div>
-      <h2>No packages waiting</h2>
-      <p>You're all caught up! Check back after your next delivery.</p>
-    </section>
-
-    <!-- Package list -->
-    <section v-else class="packages-section" :class="{ visible: loaded }">
-      <div class="section-header">
-        <h2>Ready for Pickup</h2>
-        <span class="count-badge">{{ packages.length }}</span>
-      </div>
-
-      <ul class="package-list">
-        <li
-          v-for="(pkg, i) in packages"
-          :key="pkg.id"
-          class="package-card"
-          :class="{ 'picking-up': pickingUp === pkg.id, 'picked-up': pickedUp.has(pkg.id) }"
-          :style="{ animationDelay: `${i * 80}ms` }"
-        >
-          <div class="carrier-badge">{{ carrierIcon(pkg.carrier) }}</div>
-
-          <div class="pkg-info">
-            <div class="pkg-carrier">{{ pkg.carrier }}</div>
-            <div class="pkg-tracking" v-if="pkg.trackingNumber">{{ pkg.trackingNumber }}</div>
-            <div class="pkg-arrived">Arrived {{ formatDate(pkg.checkedInAt) }}</div>
-            <div class="pkg-notes" v-if="pkg.notes">📝 {{ pkg.notes }}</div>
-          </div>
-
-          <div class="pkg-action">
-            <div v-if="pickedUp.has(pkg.id)" class="done-check">✓</div>
-            <button
-              v-else
-              class="pickup-btn"
-              :disabled="pickingUp === pkg.id"
-              @click="confirmPickup(pkg)"
-            >
-              <span v-if="pickingUp === pkg.id" class="btn-spinner" />
-              <span v-else>Pick Up</span>
-            </button>
-          </div>
-        </li>
-      </ul>
-
-      <div class="bulk-action" v-if="pendingCount > 1">
-        <button class="bulk-btn" :disabled="!!pickingUp" @click="pickUpAll">
-          Pick Up All {{ pendingCount }} Packages
-        </button>
-      </div>
-    </section>
-
-    <!-- All done toast -->
-    <transition name="toast">
-      <div v-if="allDone" class="all-done-toast">
-        ✅ All picked up! See you next time, {{ fullName }}.
-      </div>
-    </transition>
-  </div>
-</template>
 
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { subscribeToUser, subscribeToPendingPackagesForResident, checkOutPackage } from '@/services/firestoreService'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
-
-// ── Instant name from router state (passed by ScanView on redirect) ────────
-const routerName = history.state?.userName ?? ''
-const routerUnit = history.state?.userUnit ?? ''
+const auth = useAuthStore()
 
 // ── Data ───────────────────────────────────────────────────────────────────
-const user = ref(null)
+const user = ref(auth.user) // pre-populated from store immediately
 const packages = ref([])
 const loading = ref(true)
 const loaded = ref(false)
-const greetingVisible = ref(false)
+const greetingVisible = ref(!!auth.user)
 const pickingUp = ref(null)
 const pickedUp = ref(new Set())
 const allDone = ref(false)
 
-// ── Display values — router state shows instantly, live data takes over ────
-const fullName = computed(() => user.value?.name ?? routerName)
-const displayUnit = computed(() => user.value?.unit ?? routerUnit)
+// ── Display values — store provides instant name, listener keeps it live ──
+const fullName = computed(() => user.value?.name ?? auth.displayName)
+const displayUnit = computed(() => user.value?.unit ?? auth.unit)
 
 const initials = computed(() => {
   const name = fullName.value
@@ -147,10 +53,10 @@ let unsubPackages = null
 onMounted(() => {
   const cardId = route.params.cardId
 
-  // Show greeting immediately from router state while Firestore connects
-  if (routerName) setTimeout(() => { greetingVisible.value = true }, 50)
+  // Start session timer immediately — always counts down regardless of packages
+  startSessionTimer()
 
-  // Subscribe to user document — updates live if admin changes their info
+  // Subscribe to user document — keeps name/unit live if admin edits profile
   unsubUser = subscribeToUser(cardId,
     (userData) => {
       user.value = userData
@@ -159,17 +65,17 @@ onMounted(() => {
     (err) => console.error('[ResidentView] user listener error:', err)
   )
 
-  // Subscribe to pending packages — updates live as staff logs new packages
+  // Subscribe to pending packages
   unsubPackages = subscribeToPendingPackagesForResident(cardId,
     (pkgData) => {
       packages.value = pkgData
       loading.value = false
       setTimeout(() => { loaded.value = true }, 50)
-      if (!sessionTimer) startSessionTimer()
     },
     (err) => {
       console.error('[ResidentView] packages listener error:', err)
       loading.value = false
+      setTimeout(() => { loaded.value = true }, 50)
     }
   )
 })
@@ -226,6 +132,100 @@ function carrierIcon(carrier) {
   return icons[carrier] ?? '📫'
 }
 </script>
+
+<template>
+  <div class="resident-view">
+    <div class="pulse-bg" />
+
+    <!-- Header -->
+    <header class="header">
+      <button class="back-btn" @click="goBack">← Back</button>
+      <div class="logo">
+        <span class="logo-icon">📬</span>
+        <span class="logo-text">MAILROOM</span>
+      </div>
+      <div class="session-timer" :class="{ urgent: timeLeft <= 15 }">
+        <svg viewBox="0 0 24 24" class="timer-icon"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="1.5" fill="none"/><path d="M12 7v5l3 3" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" fill="none"/></svg>
+        {{ timeLeft }}s
+      </div>
+    </header>
+
+    <!-- Greeting — shows immediately from router state, no Firestore wait -->
+    <section class="greeting" :class="{ visible: greetingVisible }">
+      <div class="avatar">{{ initials }}</div>
+      <div class="greeting-text">
+        <h1>Hey, {{ fullName }}!</h1>
+        <p class="unit-tag">Unit {{ displayUnit }}</p>
+      </div>
+    </section>
+
+    <!-- Loading -->
+    <div v-if="loading" class="loading-state">
+      <div class="loading-bars"><span /><span /><span /></div>
+      <p>Loading your packages...</p>
+    </div>
+
+    <!-- No packages -->
+    <section v-else-if="packages.length === 0" class="empty-state" :class="{ visible: loaded }">
+      <div class="empty-icon">📭</div>
+      <h2>No packages available</h2>
+      <p>You have no packages to pick up right now.</p>
+    </section>
+
+    <!-- Package list -->
+    <section v-else class="packages-section" :class="{ visible: loaded }">
+      <div class="section-header">
+        <h2>Ready for Pickup</h2>
+        <span class="count-badge">{{ packages.length }}</span>
+      </div>
+
+      <ul class="package-list">
+        <li
+          v-for="(pkg, i) in packages"
+          :key="pkg.id"
+          class="package-card"
+          :class="{ 'picking-up': pickingUp === pkg.id, 'picked-up': pickedUp.has(pkg.id) }"
+          :style="{ animationDelay: `${i * 80}ms` }"
+        >
+          <div class="carrier-badge">{{ carrierIcon(pkg.carrier) }}</div>
+
+          <div class="pkg-info">
+            <div class="pkg-carrier">{{ pkg.carrier }}</div>
+            <div class="pkg-tracking" v-if="pkg.trackingNumber">{{ pkg.trackingNumber }}</div>
+            <div class="pkg-arrived">Arrived {{ formatDate(pkg.checkedInAt) }}</div>
+            <div class="pkg-notes" v-if="pkg.notes">📝 {{ pkg.notes }}</div>
+          </div>
+
+          <div class="pkg-action">
+            <div v-if="pickedUp.has(pkg.id)" class="done-check">✓</div>
+            <button
+              v-else
+              class="pickup-btn"
+              :disabled="pickingUp === pkg.id"
+              @click="confirmPickup(pkg)"
+            >
+              <span v-if="pickingUp === pkg.id" class="btn-spinner" />
+              <span v-else>Pick Up</span>
+            </button>
+          </div>
+        </li>
+      </ul>
+
+      <div class="bulk-action" v-if="pendingCount > 1">
+        <button class="bulk-btn" :disabled="!!pickingUp" @click="pickUpAll">
+          Pick Up All {{ pendingCount }} Packages
+        </button>
+      </div>
+    </section>
+
+    <!-- All done toast -->
+    <transition name="toast">
+      <div v-if="allDone" class="all-done-toast">
+        ✅ All picked up! See you next time, {{ fullName }}.
+      </div>
+    </transition>
+  </div>
+</template>
 
 <style scoped>
 @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;600&display=swap');

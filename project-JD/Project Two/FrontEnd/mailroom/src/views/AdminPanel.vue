@@ -2,13 +2,235 @@
 <!-- Admin-only view. Manage users/cards, assign roles, view audit log.     -->
 <!-- Tabs: Users, Register Card, Audit Log                                  -->
 
+<script setup>
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
+import { useRouter } from 'vue-router'
+import {
+  registerUser,
+  updateUser,
+  subscribeToAllUsers,
+  subscribeToAllPendingPackages,
+  subscribeToAllTransactions,
+} from '@/services/firestoreService'
+import { useAuthStore } from '@/stores/auth'
+import { ROLES } from '@/models'
+import { useCardReader } from '@/composables/useCardReader'
+
+const router = useRouter()
+const auth = useAuthStore()
+
+if (!auth.isLoggedIn || !auth.isAdmin) {
+  router.replace({ name: 'scan' })
+}
+
+// ── Tabs ───────────────────────────────────────────────────────────────────
+const tabs = [
+  { id: 'users',    label: 'Users',         icon: '👤' },
+  { id: 'register', label: 'Register Card', icon: '💳' },
+  { id: 'audit',    label: 'Audit Log',     icon: '📋' },
+]
+const activeTab = ref('users')
+
+// ── Users tab ──────────────────────────────────────────────────────────────
+const allUsers = ref([])
+const loadingUsers = ref(true)
+const userSearch = ref('')
+const roleFilter = ref('all')
+
+const filteredUsers = computed(() => {
+  let list = allUsers.value
+  if (roleFilter.value !== 'all') list = list.filter(u => u.role === roleFilter.value)
+  if (userSearch.value) {
+    const q = userSearch.value.toLowerCase()
+    list = list.filter(u =>
+      u.name?.toLowerCase().includes(q) ||
+      u.email?.toLowerCase().includes(q) ||
+      u.unit?.toLowerCase().includes(q)
+    )
+  }
+  return list
+})
+
+const totalUsers = computed(() => allUsers.value.length)
+
+// ── Stats ──────────────────────────────────────────────────────────────────
+const pendingCount = ref(0)
+
+// ── Register card tab ──────────────────────────────────────────────────────
+const regForm = ref({ cardId: '', name: '', unit: '', email: '', role: ROLES.RESIDENT })
+const registering = ref(false)
+const registerMsg = ref('')
+const registerMsgType = ref('success')
+const manualCardEntry = ref(false)
+
+const canRegister = computed(() =>
+  regForm.value.cardId &&
+  regForm.value.name &&
+  regForm.value.unit &&
+  regForm.value.email &&
+  regForm.value.role
+)
+
+// Capture swipe on register tab in swipe mode (not manual entry mode)
+const captureEnabled = computed(() =>
+  activeTab.value === 'register' && !manualCardEntry.value && !regForm.value.cardId
+)
+
+const { isListening } = useCardReader({
+  enabled: captureEnabled,
+  onSwipe: ({ cardId }) => {
+    if (activeTab.value === 'register' && !regForm.value.cardId) {
+      regForm.value.cardId = cardId
+    }
+  },
+})
+
+async function registerCard() {
+  if (!canRegister.value || registering.value) return
+  registering.value = true
+
+  try {
+    // Check if card already registered
+    const existing = allUsers.value.find(u => u.id === regForm.value.cardId)
+    if (existing) {
+      registerMsg.value = `⚠ Card already registered to ${existing.name}`
+      registerMsgType.value = 'error'
+      return
+    }
+
+    await registerUser({
+      cardId: regForm.value.cardId,
+      name: regForm.value.name,
+      unit: regForm.value.unit,
+      email: regForm.value.email,
+      role: regForm.value.role,
+    })
+
+    allUsers.value.unshift({ id: regForm.value.cardId, ...regForm.value, active: true })
+
+    registerMsg.value = `✓ ${regForm.value.name} registered successfully`
+    registerMsgType.value = 'success'
+
+    regForm.value = { cardId: '', name: '', unit: '', email: '', role: ROLES.RESIDENT }
+    manualCardEntry.value = false
+    setTimeout(() => { registerMsg.value = '' }, 4000)
+
+  } catch (err) {
+    registerMsg.value = `Error: ${err.message}`
+    registerMsgType.value = 'error'
+  } finally {
+    registering.value = false
+  }
+}
+
+// ── Edit user ──────────────────────────────────────────────────────────────
+const editingUser = ref(null)
+const editForm = ref({})
+const saving = ref(false)
+
+function openEdit(user) {
+  editingUser.value = user
+  editForm.value = { name: user.name, email: user.email, unit: user.unit }
+}
+
+async function saveEdit() {
+  saving.value = true
+  try {
+    await updateUser(editingUser.value.id, editForm.value)
+    Object.assign(editingUser.value, editForm.value)
+    editingUser.value = null
+  } catch (err) {
+    console.error(err)
+  } finally {
+    saving.value = false
+  }
+}
+
+async function updateRole(user, role) {
+  await updateUser(user.id, { role })
+  user.role = role
+}
+
+async function toggleActive(user) {
+  const newVal = !user.active
+  await updateUser(user.id, { active: newVal })
+  user.active = newVal
+}
+
+// ── Audit log tab ──────────────────────────────────────────────────────────
+const transactions = ref([])
+const loadingAudit = ref(true)
+
+// ── Listeners ──────────────────────────────────────────────────────────────
+let unsubUsers = null
+let unsubPending = null
+let unsubTransactions = null
+
+onMounted(() => {
+  // Live user list
+  unsubUsers = subscribeToAllUsers(
+    (users) => { allUsers.value = users; loadingUsers.value = false },
+    (err) => { console.error('[AdminPanel] users error:', err); loadingUsers.value = false }
+  )
+
+  // Live pending count for header stat
+  unsubPending = subscribeToAllPendingPackages(
+    (pkgs) => { pendingCount.value = pkgs.length },
+    (err) => console.error('[AdminPanel] pending error:', err)
+  )
+
+  // Live audit log
+  unsubTransactions = subscribeToAllTransactions(100,
+    (txs) => { transactions.value = txs; loadingAudit.value = false },
+    (err) => { console.error('[AdminPanel] audit error:', err); loadingAudit.value = false }
+  )
+})
+
+onUnmounted(() => {
+  unsubUsers?.()
+  unsubPending?.()
+  unsubTransactions?.()
+})
+
+// ── Helpers ────────────────────────────────────────────────────────────────
+function goBack() { router.push({ name: 'scan' }) }
+function goToStaff() { router.push({ name: 'staff-dashboard' }) }
+function signOut() { auth.logout(); router.push({ name: 'scan' }) }
+
+function resolvePerformedBy(performedBy) {
+  if (!performedBy) return '—'
+  const user = allUsers.value.find(u => u.id === performedBy)
+  if (user) return user.name
+  if (performedBy === 'staff') return 'Staff (legacy)'
+  return truncateCard(performedBy)
+}
+
+function initials(name) {
+  return name?.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() ?? '?'
+}
+
+function truncateCard(id) {
+  if (!id) return '—'
+  return id.length > 12 ? id.slice(0, 6) + '…' + id.slice(-4) : id
+}
+
+function formatTimestamp(ts) {
+  if (!ts) return '—'
+  const d = ts.toDate ? ts.toDate() : new Date(ts)
+  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
+    ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+}
+</script>
+
 <template>
   <div class="admin-panel">
 
     <!-- Header -->
     <header class="admin-header">
       <div class="header-left">
-        <button class="back-link" @click="goBack">← Dashboard</button>
+        <button class="back-link" @click="goBack">← Scanner</button>
+        <div class="divider-v" />
+        <button class="back-link" @click="goToStaff">Staff Dashboard</button>
         <div class="divider-v" />
         <span class="admin-badge">ADMIN</span>
         <h1 class="header-title">System Administration</h1>
@@ -16,6 +238,7 @@
       <div class="header-right">
         <div class="live-dot" />
         <span class="live-label">{{ totalUsers }} users · {{ pendingCount }} pending packages</span>
+        <button class="signout-btn" @click="signOut">Sign Out</button>
       </div>
     </header>
 
@@ -121,9 +344,14 @@
           <div class="register-form-wrap">
             <div class="form-block">
               <div class="form-block-title">
-                <span class="fbt-num">①</span> Swipe the Card
+                <span class="fbt-num">①</span> Swipe or Enter Card ID
+                <button class="manual-toggle-btn" @click="manualCardEntry = !manualCardEntry">
+                  {{ manualCardEntry ? '💳 Use Swipe Instead' : '⌨️ Enter Manually' }}
+                </button>
               </div>
-              <div class="swipe-zone" :class="{ 'has-card': regForm.cardId }">
+
+              <!-- Swipe mode -->
+              <div v-if="!manualCardEntry" class="swipe-zone" :class="{ 'has-card': regForm.cardId }">
                 <div v-if="!regForm.cardId" class="swipe-prompt">
                   <div class="swipe-card-icon">💳</div>
                   <p>Swipe the card to capture its ID</p>
@@ -137,6 +365,23 @@
                   </div>
                   <button class="swipe-reset" @click="regForm.cardId = ''">✕</button>
                 </div>
+              </div>
+
+              <!-- Manual entry mode -->
+              <div v-else class="manual-card-entry">
+                <label class="field-label">Card ID</label>
+                <div class="manual-card-row">
+                  <input
+                    v-model="regForm.cardId"
+                    class="field-input"
+                    placeholder="Enter or paste card ID..."
+                    @keydown.enter="$event.target.blur()"
+                  />
+                  <button v-if="regForm.cardId" class="swipe-reset inline" @click="regForm.cardId = ''">✕</button>
+                </div>
+                <p class="manual-card-hint">
+                  Type the card ID directly, or swipe the card while this input is focused.
+                </p>
               </div>
             </div>
 
@@ -223,7 +468,7 @@
           <div class="audit-head">
             <span>Timestamp</span>
             <span>Type</span>
-            <span>Card ID</span>
+            <span>Recipient Card</span>
             <span>Package ID</span>
             <span>Performed By</span>
           </div>
@@ -240,7 +485,7 @@
               </span>
               <code class="audit-card">{{ truncateCard(tx.cardId) }}</code>
               <code class="audit-pkg">{{ tx.packageId?.slice(0, 10) }}…</code>
-              <code class="audit-by">{{ truncateCard(tx.performedBy) }}</code>
+              <span class="audit-by">{{ resolvePerformedBy(tx.performedBy) }}</span>
             </div>
             <div v-if="transactions.length === 0" class="audit-empty">
               No transactions recorded yet.
@@ -286,206 +531,6 @@
 
   </div>
 </template>
-
-<script setup>
-import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
-import { useRouter } from 'vue-router'
-import {
-  registerUser,
-  updateUser,
-  subscribeToAllUsers,
-  subscribeToAllPendingPackages,
-  subscribeToAllTransactions,
-} from '@/services/firestoreService'
-import { ROLES } from '@/models'
-import { useCardReader } from '@/composables/useCardReader'
-
-const router = useRouter()
-
-// ── Tabs ───────────────────────────────────────────────────────────────────
-const tabs = [
-  { id: 'users',    label: 'Users',         icon: '👤' },
-  { id: 'register', label: 'Register Card', icon: '💳' },
-  { id: 'audit',    label: 'Audit Log',     icon: '📋' },
-]
-const activeTab = ref('users')
-
-// ── Users tab ──────────────────────────────────────────────────────────────
-const allUsers = ref([])
-const loadingUsers = ref(true)
-const userSearch = ref('')
-const roleFilter = ref('all')
-
-const filteredUsers = computed(() => {
-  let list = allUsers.value
-  if (roleFilter.value !== 'all') list = list.filter(u => u.role === roleFilter.value)
-  if (userSearch.value) {
-    const q = userSearch.value.toLowerCase()
-    list = list.filter(u =>
-      u.name?.toLowerCase().includes(q) ||
-      u.email?.toLowerCase().includes(q) ||
-      u.unit?.toLowerCase().includes(q)
-    )
-  }
-  return list
-})
-
-const totalUsers = computed(() => allUsers.value.length)
-
-// ── Stats ──────────────────────────────────────────────────────────────────
-const pendingCount = ref(0)
-
-// ── Register card tab ──────────────────────────────────────────────────────
-const regForm = ref({ cardId: '', name: '', unit: '', email: '', role: ROLES.RESIDENT })
-const registering = ref(false)
-const registerMsg = ref('')
-const registerMsgType = ref('success')
-
-const canRegister = computed(() =>
-  regForm.value.cardId &&
-  regForm.value.name &&
-  regForm.value.unit &&
-  regForm.value.email &&
-  regForm.value.role
-)
-
-// Only capture card swipe on the register tab
-const captureEnabled = computed(() => activeTab.value === 'register' && !regForm.value.cardId)
-
-const { isListening } = useCardReader({
-  enabled: captureEnabled,
-  onSwipe: ({ cardId }) => {
-    if (activeTab.value === 'register' && !regForm.value.cardId) {
-      regForm.value.cardId = cardId
-    }
-  },
-})
-
-async function registerCard() {
-  if (!canRegister.value || registering.value) return
-  registering.value = true
-
-  try {
-    // Check if card already registered
-    const existing = allUsers.value.find(u => u.id === regForm.value.cardId)
-    if (existing) {
-      registerMsg.value = `⚠ Card already registered to ${existing.name}`
-      registerMsgType.value = 'error'
-      return
-    }
-
-    await registerUser({
-      cardId: regForm.value.cardId,
-      name: regForm.value.name,
-      unit: regForm.value.unit,
-      email: regForm.value.email,
-      role: regForm.value.role,
-    })
-
-    allUsers.value.unshift({ id: regForm.value.cardId, ...regForm.value, active: true })
-
-    registerMsg.value = `✓ ${regForm.value.name} registered successfully`
-    registerMsgType.value = 'success'
-
-    regForm.value = { cardId: '', name: '', unit: '', email: '', role: ROLES.RESIDENT }
-    setTimeout(() => { registerMsg.value = '' }, 4000)
-
-  } catch (err) {
-    registerMsg.value = `Error: ${err.message}`
-    registerMsgType.value = 'error'
-  } finally {
-    registering.value = false
-  }
-}
-
-// ── Edit user ──────────────────────────────────────────────────────────────
-const editingUser = ref(null)
-const editForm = ref({})
-const saving = ref(false)
-
-function openEdit(user) {
-  editingUser.value = user
-  editForm.value = { name: user.name, email: user.email, unit: user.unit }
-}
-
-async function saveEdit() {
-  saving.value = true
-  try {
-    await updateUser(editingUser.value.id, editForm.value)
-    Object.assign(editingUser.value, editForm.value)
-    editingUser.value = null
-  } catch (err) {
-    console.error(err)
-  } finally {
-    saving.value = false
-  }
-}
-
-async function updateRole(user, role) {
-  await updateUser(user.id, { role })
-  user.role = role
-}
-
-async function toggleActive(user) {
-  const newVal = !user.active
-  await updateUser(user.id, { active: newVal })
-  user.active = newVal
-}
-
-// ── Audit log tab ──────────────────────────────────────────────────────────
-const transactions = ref([])
-const loadingAudit = ref(true)
-
-// ── Listeners ──────────────────────────────────────────────────────────────
-let unsubUsers = null
-let unsubPending = null
-let unsubTransactions = null
-
-onMounted(() => {
-  // Live user list
-  unsubUsers = subscribeToAllUsers(
-    (users) => { allUsers.value = users; loadingUsers.value = false },
-    (err) => { console.error('[AdminPanel] users error:', err); loadingUsers.value = false }
-  )
-
-  // Live pending count for header stat
-  unsubPending = subscribeToAllPendingPackages(
-    (pkgs) => { pendingCount.value = pkgs.length },
-    (err) => console.error('[AdminPanel] pending error:', err)
-  )
-
-  // Live audit log
-  unsubTransactions = subscribeToAllTransactions(100,
-    (txs) => { transactions.value = txs; loadingAudit.value = false },
-    (err) => { console.error('[AdminPanel] audit error:', err); loadingAudit.value = false }
-  )
-})
-
-onUnmounted(() => {
-  unsubUsers?.()
-  unsubPending?.()
-  unsubTransactions?.()
-})
-
-// ── Helpers ────────────────────────────────────────────────────────────────
-function goBack() { router.push({ name: 'staff-dashboard' }) }
-
-function initials(name) {
-  return name?.split(' ').map(w => w[0]).slice(0, 2).join('').toUpperCase() ?? '?'
-}
-
-function truncateCard(id) {
-  if (!id) return '—'
-  return id.length > 12 ? id.slice(0, 6) + '…' + id.slice(-4) : id
-}
-
-function formatTimestamp(ts) {
-  if (!ts) return '—'
-  const d = ts.toDate ? ts.toDate() : new Date(ts)
-  return d.toLocaleDateString([], { month: 'short', day: 'numeric' }) +
-    ' ' + d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-}
-</script>
 
 <style scoped>
 @import url('https://fonts.googleapis.com/css2?family=Fraunces:wght@400;600;700&family=Epilogue:wght@300;400;500;600&display=swap');
@@ -566,6 +611,20 @@ function formatTimestamp(ts) {
   color: rgba(255,255,255,0.45);
   font-family: monospace;
 }
+
+.signout-btn {
+  background: none;
+  border: 1px solid rgba(255,255,255,0.15);
+  color: rgba(255,255,255,0.4);
+  padding: 0.35rem 0.85rem;
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  cursor: pointer;
+  transition: all 0.15s;
+  margin-left: 1rem;
+}
+.signout-btn:hover { border-color: #f85149; color: #f85149; }
 
 /* ── Tab bar ───────────────────────────────────────────────────────────── */
 .tab-bar {
@@ -845,6 +904,39 @@ function formatTimestamp(ts) {
   font-size: 1rem;
 }
 .swipe-reset:hover { color: #dc2626; }
+
+.manual-toggle-btn {
+  margin-left: auto;
+  background: none;
+  border: 1px solid #e5e5e0;
+  border-radius: 6px;
+  padding: 0.25rem 0.65rem;
+  font-family: 'Epilogue', sans-serif;
+  font-size: 0.72rem;
+  color: #888;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.manual-toggle-btn:hover { border-color: #1c1c1c; color: #1c1c1c; }
+
+.manual-card-entry { display: flex; flex-direction: column; gap: 0.4rem; }
+.manual-card-row { display: flex; gap: 0.5rem; align-items: center; }
+.manual-card-row .field-input { flex: 1; }
+.swipe-reset.inline {
+  position: static;
+  background: #f5f5f0;
+  border: 1px solid #e5e5e0;
+  border-radius: 6px;
+  color: #aaa;
+  padding: 0.4rem 0.6rem;
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: all 0.15s;
+  flex-shrink: 0;
+}
+.swipe-reset.inline:hover { border-color: #dc2626; color: #dc2626; background: #fef2f2; }
+.manual-card-hint { font-size: 0.72rem; color: #aaa; margin-top: 0.1rem; }
 
 /* Fields */
 .field-row { display: grid; grid-template-columns: 1fr 1fr; gap: 0.75rem; }
