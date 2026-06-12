@@ -3,6 +3,8 @@ import mongoose from 'mongoose';
 import Appointment from '../models/Appointment.js';
 import User from '../../users/models/User.js';
 import { authenticate } from '../../middleware/auth.js';
+import { sendEmail } from '../../utils/mailer.js';
+import { appointmentEmail } from '../../utils/emailTemplates.js';
 
 const router = express.Router();
 const isValidId = (id) => mongoose.Types.ObjectId.isValid(id);
@@ -48,8 +50,22 @@ router.post('/appointments', authenticate, async (req, res) => {
         });
 
         const populated = await Appointment.findById(appointment._id)
-            .populate('requester', 'firstname lastname role')
-            .populate('recipient', 'firstname lastname role specialization');
+            .populate('requester', 'firstname lastname role email')
+            .populate('recipient', 'firstname lastname role specialization email')
+            .populate('patient', 'firstname lastname email');
+
+        // Fire off notification emails (non-blocking — failures won't break the response)
+        const patientEmail = populated.patient?.email;
+        const providerEmail = populated.recipient?.email;
+
+        if (patientEmail) {
+            const { subject, html } = appointmentEmail(populated, 'patient');
+            sendEmail({ to: patientEmail, subject, html });
+        }
+        if (providerEmail && providerEmail !== patientEmail) {
+            const { subject, html } = appointmentEmail(populated, 'provider');
+            sendEmail({ to: providerEmail, subject, html });
+        }
 
         res.status(201).json(populated);
     } catch (err) {
@@ -131,9 +147,18 @@ router.patch('/appointments/:id/status', authenticate, async (req, res) => {
         await appointment.save();
 
         const populated = await Appointment.findById(id)
-            .populate('requester', 'firstname lastname role')
-            .populate('recipient', 'firstname lastname role specialization')
-            .populate('patient', 'firstname lastname');
+            .populate('requester', 'firstname lastname role email')
+            .populate('recipient', 'firstname lastname role specialization email')
+            .populate('patient', 'firstname lastname email');
+
+        // Notify the patient when the status meaningfully changes
+        if (['confirmed', 'declined', 'cancelled', 'completed'].includes(status)) {
+            const patientEmail = populated.patient?.email;
+            if (patientEmail) {
+                const { subject, html } = appointmentEmail(populated, 'patient');
+                sendEmail({ to: patientEmail, subject, html });
+            }
+        }
 
         res.json(populated);
     } catch (err) {

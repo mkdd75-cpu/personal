@@ -5,6 +5,8 @@ import User from '../models/User.js';
 import MedicalRecord from '../models/MedicalRecord.js';
 import Encounter from '../models/Encounter.js';
 import { signToken, authenticate, authorize, authorizeSelf } from '../../middleware/auth.js';
+import { sendEmail } from '../../utils/mailer.js';
+import { welcomeEmail } from '../../utils/emailTemplates.js';
 
 const router = express.Router();
 const PASSWORD_SALT_ROUNDS = 12;
@@ -62,6 +64,12 @@ router.post('/user', async (req, res) => {
         const token = signToken(newUser);
         const userResponse = newUser.toObject();
         delete userResponse.password;
+
+        // Send a welcome email (non-blocking — a failure won't fail signup)
+        if (newUser.email) {
+            const { subject, html } = welcomeEmail(newUser);
+            sendEmail({ to: newUser.email, subject, html });
+        }
 
         res.status(201).json({ message: 'User created successfully', token, user: userResponse });
     } catch (err) {
