@@ -106,13 +106,20 @@ async function submitEncounter() {
       </div>
 
       <div class="card">
-        <div class="card-header"><h3>Ratings</h3></div>
+        <div class="card-header"><h3>Ratings &amp; Reviews</h3></div>
         <div class="card-body">
           <div v-if="averageRating" class="rating-row">
             <span class="rating-num">{{ averageRating }}</span>
-            <span class="text-muted">/ 5.0</span>
+            <span class="text-muted">/ 5.0 average</span>
           </div>
           <p v-else class="text-muted" style="font-size:.9rem">No ratings yet</p>
+
+          <div v-if="(user.reviews || []).length" class="reviews-list mt-2">
+            <div v-for="(review, i) in user.reviews" :key="i" class="review-item">
+              <strong>{{ review.reviewer }}</strong>: {{ review.comment }}
+              <span class="badge badge-green ml-1">{{ review.rating }}/5</span>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -198,6 +205,9 @@ async function submitEncounter() {
 .span-2 { grid-column: 1 / -1; }
 .rating-row { display: flex; align-items: baseline; gap: 6px; }
 .rating-num { font-size: 2rem; font-weight: 700; color: var(--green); }
+.reviews-list { display: flex; flex-direction: column; gap: 0.5rem; }
+.review-item { font-size: 0.88rem; color: var(--gray-700); padding: 0.5rem; background: var(--gray-50); border-radius: var(--radius-sm); }
+.ml-1 { margin-left: 0.25rem; }
 .actions-col { display: flex; flex-direction: column; gap: 0.6rem; }
 .action-btn { display: flex; align-items: center; gap: 10px; width: 100%; padding: .75rem 1rem; border: 1.5px solid var(--green-200); border-radius: var(--radius-md); background: var(--green-50); color: var(--green-800); font-size: .9rem; font-weight: 600; cursor: pointer; transition: all .18s; font-family: var(--font); }
 .action-btn:hover { background: var(--green); color: var(--white); border-color: var(--green); }

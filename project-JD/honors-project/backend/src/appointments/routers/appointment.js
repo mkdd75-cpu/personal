@@ -186,7 +186,7 @@ router.post('/ratings/:userId', authenticate, async (req, res) => {
     }
 
     try {
-        const target = await User.findById(userId);
+        const target = await User.findById(userId).select('role ratings');
         if (!target) {
             return res.status(404).json({ error: 'User not found' });
         }
@@ -194,22 +194,30 @@ router.post('/ratings/:userId', authenticate, async (req, res) => {
             return res.status(400).json({ error: 'Only doctors and preceptors can be rated' });
         }
 
-        target.ratings.push(numericRating);
-        target.reviews.push({
+        // Atomic push — avoids re-validating the entire user document, which
+        // could otherwise fail on unrelated legacy fields.
+        const review = {
             reviewer: `${req.user.firstname} ${req.user.lastname}`,
             rating: numericRating,
             comment: comment || '',
             date: new Date(),
-        });
-        await target.save();
+        };
 
-        const avg =
-            target.ratings.reduce((a, b) => a + b, 0) / target.ratings.length;
+        const updated = await User.findByIdAndUpdate(
+            userId,
+            { $push: { ratings: numericRating, reviews: review } },
+            { new: true, runValidators: false }
+        ).select('ratings');
+
+        const allRatings = updated.ratings || [];
+        const avg = allRatings.length
+            ? allRatings.reduce((a, b) => a + b, 0) / allRatings.length
+            : numericRating;
 
         res.status(201).json({
             message: 'Rating submitted',
             averageRating: avg.toFixed(1),
-            totalRatings: target.ratings.length,
+            totalRatings: allRatings.length,
         });
     } catch (err) {
         console.error('Rating error:', err);

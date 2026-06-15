@@ -132,27 +132,33 @@ router.patch('/records/:patientId/labs', authenticate, clinicalStaff, async (req
 
 /**
  * PATCH /records/:patientId/history
- * Update the medical history (chronic conditions, allergies, surgeries, family history).
- * Replaces whichever arrays are provided in the body.
+ * Add to the medical history (chronic conditions, allergies, surgeries, family history).
+ * New items are MERGED with existing ones (deduplicated), so the input form can
+ * stay blank and only ever submit additions.
  */
 router.patch('/records/:patientId/history', authenticate, clinicalStaff, async (req, res) => {
     const { patientId } = req.params;
     const { chronicConditions, allergies, surgeries, familyHistory } = req.body;
 
-    const update = {};
-    if (Array.isArray(chronicConditions)) update['medicalHistory.chronicConditions'] = chronicConditions;
-    if (Array.isArray(allergies)) update['medicalHistory.allergies'] = allergies;
-    if (Array.isArray(surgeries)) update['medicalHistory.surgeries'] = surgeries;
-    if (Array.isArray(familyHistory)) update['medicalHistory.familyHistory'] = familyHistory;
+    // Build a $addToSet update so new entries are appended without duplicates
+    const addToSet = {};
+    if (Array.isArray(chronicConditions) && chronicConditions.length)
+        addToSet['medicalHistory.chronicConditions'] = { $each: chronicConditions };
+    if (Array.isArray(allergies) && allergies.length)
+        addToSet['medicalHistory.allergies'] = { $each: allergies };
+    if (Array.isArray(surgeries) && surgeries.length)
+        addToSet['medicalHistory.surgeries'] = { $each: surgeries };
+    if (Array.isArray(familyHistory) && familyHistory.length)
+        addToSet['medicalHistory.familyHistory'] = { $each: familyHistory };
 
-    if (Object.keys(update).length === 0) {
-        return res.status(400).json({ error: 'No valid history fields provided' });
+    if (Object.keys(addToSet).length === 0) {
+        return res.status(400).json({ error: 'No history items provided' });
     }
 
     try {
         const record = await MedicalRecord.findOneAndUpdate(
             { patient: patientId },
-            { $set: update },
+            { $addToSet: addToSet },
             { new: true, upsert: true }
         );
         res.json(record);

@@ -56,14 +56,9 @@ async function loadRecord() {
     record.value = await res.json()
     encounters.value = record.value.encounters || []
 
-    // Pre-fill history editor
-    const h = record.value.medicalHistory || {}
-    historyEdit.value = {
-      chronicConditions: (h.chronicConditions || []).join(', '),
-      allergies: (h.allergies || []).join(', '),
-      surgeries: (h.surgeries || []).join(', '),
-      familyHistory: (h.familyHistory || []).join(', '),
-    }
+    // History inputs start blank — they are "add new item" fields. Existing
+    // saved history is shown above the inputs (read-only) in the History tab.
+    historyEdit.value = { chronicConditions: '', allergies: '', surgeries: '', familyHistory: '' }
   } catch (err) {
     error.value = err.message
   } finally {
@@ -108,7 +103,12 @@ async function saveHistory() {
         familyHistory: toArr(historyEdit.value.familyHistory),
       }),
     })
-    if (res.ok) record.value = await res.json()
+    if (res.ok) {
+      record.value = await res.json()
+      // Leave the input boxes blank after a successful save — the saved values
+      // are now shown in the Overview tab; the inputs become "add more" fields.
+      historyEdit.value = { chronicConditions: '', allergies: '', surgeries: '', familyHistory: '' }
+    }
   } catch (err) { console.error(err) }
   finally { savingSection.value = '' }
 }
@@ -244,7 +244,35 @@ const history = computed(() => record.value?.medicalHistory || {})
 
               <!-- HISTORY -->
               <div v-show="activeTab === 'history'" class="tab-pane">
-                <p class="hint">Enter comma-separated values.</p>
+                <!-- Existing recorded history (read-only) -->
+                <div v-if="history.chronicConditions?.length || history.allergies?.length || history.surgeries?.length || history.familyHistory?.length" class="existing-history">
+                  <div v-if="history.chronicConditions?.length" class="eh-group">
+                    <span class="eh-label">Conditions</span>
+                    <div class="chip-row">
+                      <span v-for="c in history.chronicConditions" :key="c" class="chip">{{ c }}</span>
+                    </div>
+                  </div>
+                  <div v-if="history.allergies?.length" class="eh-group">
+                    <span class="eh-label">Allergies</span>
+                    <div class="chip-row">
+                      <span v-for="a in history.allergies" :key="a" class="chip chip-red">{{ a }}</span>
+                    </div>
+                  </div>
+                  <div v-if="history.surgeries?.length" class="eh-group">
+                    <span class="eh-label">Surgeries</span>
+                    <div class="chip-row">
+                      <span v-for="s in history.surgeries" :key="s" class="chip">{{ s }}</span>
+                    </div>
+                  </div>
+                  <div v-if="history.familyHistory?.length" class="eh-group">
+                    <span class="eh-label">Family history</span>
+                    <div class="chip-row">
+                      <span v-for="f in history.familyHistory" :key="f" class="chip">{{ f }}</span>
+                    </div>
+                  </div>
+                </div>
+
+                <p class="hint">Add new items below (comma-separated). Existing entries above are kept.</p>
                 <label class="field">Chronic conditions
                   <input v-model="historyEdit.chronicConditions" placeholder="e.g. Hypertension, Diabetes" />
                 </label>
@@ -349,6 +377,9 @@ const history = computed(() => record.value?.medicalHistory || {})
 
 .field { display: flex; flex-direction: column; gap: 4px; font-size: 0.82rem; font-weight: 600; color: var(--gray-700); margin-bottom: 0.7rem; }
 .hint { font-size: 0.8rem; color: var(--gray-500); margin-bottom: 0.8rem; }
+.existing-history { background: var(--gray-50); border-radius: var(--radius-md); padding: 0.9rem 1rem; margin-bottom: 1rem; display: flex; flex-direction: column; gap: 0.7rem; }
+.eh-group { display: flex; flex-direction: column; gap: 5px; }
+.eh-label { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--gray-500); font-weight: 700; }
 
 .enc-form-wrap { margin-bottom: 1rem; border: 1px solid var(--green-200); border-radius: var(--radius-md); overflow: hidden; }
 .enc-form-wrap summary { padding: 0.7rem 1rem; background: var(--green-50); color: var(--green-800); font-weight: 600; font-size: 0.88rem; cursor: pointer; }
